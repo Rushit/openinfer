@@ -38,6 +38,11 @@ kernel-report = [
 ]
 
 [[test]]
+name = "e2e_scheduler"
+path = "tests/e2e_scheduler.rs"
+required-features = ["kimi-k2"]
+
+[[test]]
 name = "vllm_golden_gate"
 path = "tests/vllm_golden_gate.rs"
 required-features = ["kimi-k2"]
