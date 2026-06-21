@@ -1,9 +1,11 @@
-//! E2E scheduler contract tests for Kimi-K2 (issue #222).
+//! On-hardware E2E scheduler contract tests for Kimi-K2 (issue #222).
 //!
-//! Drives the full EngineHandle → KimiK2Scheduler path and asserts the
-//! serving contract that in-crate unit tests (using RecordingExecutor) cannot
-//! cover: echo rejection, sampling honor-or-reject, admission capacity,
-//! consumer-drop safety, and finish-reason behaviour.
+//! Drives the full EngineHandle → KimiK2Scheduler path on the default TP8/DP1
+//! NCCL shape and asserts the serving contract through the *real* wiring that a
+//! mock cannot: echo rejection, sampling honor-or-reject, admission capacity,
+//! consumer-drop safety, and finish-reason behaviour. The CPU-runnable half of
+//! the contract lives in `tests/scheduler_contract.rs`; this is the half that
+//! needs real weights and GPUs.
 //!
 //! Requires 8 GPUs and Kimi-K2 weights; skips cleanly when either is absent.
 //! Set OPENINFER_TEST_MODEL_PATH to the weight directory to run.
@@ -92,7 +94,9 @@ fn drain(rx: &mut TokenStreamReceiver) -> Vec<TokenEvent> {
             Some(event) => {
                 let done = matches!(
                     event,
-                    TokenEvent::Finished { .. } | TokenEvent::Rejected { .. } | TokenEvent::Error { .. }
+                    TokenEvent::Finished { .. }
+                        | TokenEvent::Rejected { .. }
+                        | TokenEvent::Error { .. }
                 );
                 events.push(event);
                 if done {
@@ -118,8 +122,9 @@ fn test_kimi_k2_scheduler_contract() {
     {
         let mut rx = submit(&handle, vec![1, 2, 3], 5, SamplingParams::default(), true);
         let events = drain(&mut rx);
-        let Some(TokenEvent::Rejected { message, .. }) =
-            events.iter().find(|e| matches!(e, TokenEvent::Rejected { .. }))
+        let Some(TokenEvent::Rejected { message, .. }) = events
+            .iter()
+            .find(|e| matches!(e, TokenEvent::Rejected { .. }))
         else {
             panic!("expected Rejected, got {events:?}");
         };
@@ -131,6 +136,10 @@ fn test_kimi_k2_scheduler_contract() {
     }
 
     // ── 2. Non-greedy rejection on TP8 path ──────────────────────────────────
+    // The TP8/DP1 path cannot sample the global distribution (per-rank vocab
+    // shard, #226), so sampling is rejected here by design (#237). On TP1/DP8
+    // sampling is honored instead — this assertion is specific to the TP8 shape
+    // this test starts.
     eprintln!("=== Phase 2: non-greedy rejection (TP8) ===");
     {
         let mut rx = submit(
@@ -146,8 +155,9 @@ fn test_kimi_k2_scheduler_contract() {
             false,
         );
         let events = drain(&mut rx);
-        let Some(TokenEvent::Rejected { message, .. }) =
-            events.iter().find(|e| matches!(e, TokenEvent::Rejected { .. }))
+        let Some(TokenEvent::Rejected { message, .. }) = events
+            .iter()
+            .find(|e| matches!(e, TokenEvent::Rejected { .. }))
         else {
             panic!("expected Rejected, got {events:?}");
         };
@@ -170,8 +180,9 @@ fn test_kimi_k2_scheduler_contract() {
             false,
         );
         let events = drain(&mut rx);
-        let Some(TokenEvent::Rejected { message, .. }) =
-            events.iter().find(|e| matches!(e, TokenEvent::Rejected { .. }))
+        let Some(TokenEvent::Rejected { message, .. }) = events
+            .iter()
+            .find(|e| matches!(e, TokenEvent::Rejected { .. }))
         else {
             panic!("expected Rejected, got {events:?}");
         };
@@ -179,7 +190,10 @@ fn test_kimi_k2_scheduler_contract() {
             message.contains("per-request capacity"),
             "rejection should name the limit: {message}"
         );
-        eprintln!("  PASS: {}-token prompt → Rejected(\"{message}\")", MAX_REQUEST_TOKENS + 1);
+        eprintln!(
+            "  PASS: {}-token prompt → Rejected(\"{message}\")",
+            MAX_REQUEST_TOKENS + 1
+        );
     }
 
     // ── 4. Consumer drop ─────────────────────────────────────────────────────
@@ -219,11 +233,17 @@ fn test_kimi_k2_scheduler_contract() {
     eprintln!("=== Phase 5: length termination ===");
     {
         const MAX_TOKENS: usize = 3;
+        // ignore_eos so the model cannot terminate early via a stop token —
+        // exactly MAX_TOKENS must be produced, making the Length finish
+        // deterministic regardless of what the prompt decodes to.
         let mut rx = submit(
             &handle,
             vec![1, 2, 3, 4, 5],
             MAX_TOKENS,
-            SamplingParams::default(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
             false,
         );
         let events = drain(&mut rx);

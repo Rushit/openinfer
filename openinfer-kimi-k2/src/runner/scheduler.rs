@@ -610,6 +610,118 @@ impl KimiK2Scheduler {
     }
 }
 
+/// CPU test seam (#222): drive the real [`KimiK2Scheduler`] contract — admission,
+/// sampling honor-or-reject, EOS/length finish, batched slot lifecycle — without
+/// GPUs, weights, or collectives, by faking the GPU forward with a pure
+/// next-token function. `next_token` maps each row's input token (the last
+/// prompt token at prefill, the last generated token at decode) to the token the
+/// engine would produce next; choosing the stop set against that mapping
+/// exercises every finish path. Returns the requests the KV budget deferred.
+///
+/// Exposed only under the `test-harness` feature and hidden from docs: it leaks
+/// no scheduler internals, just this one entry point, so `tests/` integration
+/// tests can cover the contract on a plain machine while the in-src unit tests
+/// above keep their own coverage.
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+pub fn drive_scheduler_batch<F>(
+    pool_pages: usize,
+    stop_token_ids: Vec<u32>,
+    requests: Vec<GenerateRequest>,
+    next_token: F,
+) -> Vec<GenerateRequest>
+where
+    // `Send + 'static` so the scripted executor satisfies the scheduler's
+    // `Box<dyn ForwardExecutor + Send>` field; plain `fn` items qualify.
+    F: Fn(u32) -> u32 + Send + 'static,
+{
+    // Block size mirrors the in-src `test_pool`; the scheduler is built directly
+    // (no `new()` warm-up forward) so the scripted executor only ever sees real
+    // requests.
+    let pool = BlockPool::new(16, pool_pages).expect("test block pool");
+    let mut scheduler = KimiK2Scheduler {
+        executor: Box::new(ScriptedExecutor { next_token }),
+        stop_token_ids,
+        pool,
+    };
+    scheduler.handle_request_batch(requests)
+}
+
+/// A `ForwardExecutor` that fakes every forward with [`drive_scheduler_batch`]'s
+/// `next_token` function. No CUDA, no collectives — pure host arithmetic.
+#[cfg(feature = "test-harness")]
+struct ScriptedExecutor<F> {
+    next_token: F,
+}
+
+#[cfg(feature = "test-harness")]
+impl<F: Fn(u32) -> u32> ForwardExecutor for ScriptedExecutor<F> {
+    fn ensure_decode_batch(&self, _decode_batch_size: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn forward_prefill(
+        &self,
+        input_ids: &[u32],
+        slot: usize,
+        _decode_batch_size: usize,
+        _cached_tokens: usize,
+        _ep_max_seq_len: usize,
+        _kv_pages: &KimiKvStepPages,
+        _row: KimiRowOptions,
+        _seed: u64,
+    ) -> Result<crate::runner::worker::KimiOneTokenForwardReport> {
+        let input = *input_ids.last().expect("prefill suffix is non-empty");
+        Ok(scripted_report(slot, input, (self.next_token)(input)))
+    }
+
+    fn forward_decode_batch(
+        &self,
+        token_ids: &[u32],
+        _append_positions: &[usize],
+        slots: &[usize],
+        _decode_batch_size: usize,
+        _kv_pages: &KimiKvStepPages,
+        _rows: &[KimiRowOptions],
+        _seed: u64,
+    ) -> Result<Vec<crate::runner::worker::KimiOneTokenForwardReport>> {
+        Ok(token_ids
+            .iter()
+            .zip(slots)
+            .map(|(&token, &slot)| scripted_report(slot, token, (self.next_token)(token)))
+            .collect())
+    }
+
+    fn worker_count(&self) -> usize {
+        1
+    }
+
+    fn gpu_weight_ready_count(&self) -> usize {
+        1
+    }
+}
+
+#[cfg(feature = "test-harness")]
+fn scripted_report(
+    slot: usize,
+    input_token_id: u32,
+    next_token_id: u32,
+) -> crate::runner::worker::KimiOneTokenForwardReport {
+    crate::runner::worker::KimiOneTokenForwardReport {
+        rank: 0,
+        batch_slot: slot,
+        input_token_id,
+        local_next_token_id: next_token_id,
+        local_next_token_global_id: next_token_id,
+        local_top_logit_f32: 0.0,
+        vocab_start: 0,
+        vocab_rows: 1,
+        dense_layers_executed: 0,
+        moe_layers_executed: 0,
+        logprob: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

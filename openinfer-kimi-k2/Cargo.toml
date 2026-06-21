@@ -30,12 +30,20 @@ tokio = { workspace = true }
 [features]
 default = []
 kimi-k2 = ["openinfer-kernels/kimi-k2"]
+# Exposes the CPU scheduler-contract test seam (drive_scheduler_batch) for the
+# scheduler_contract integration test; no effect on production builds.
+test-harness = []
 kernel-call-trace = ["openinfer-core/kernel-call-trace"]
 kernel-report = [
     "dep:clap",
     "kimi-k2",
     "kernel-call-trace",
 ]
+
+[[test]]
+name = "scheduler_contract"
+path = "tests/scheduler_contract.rs"
+required-features = ["kimi-k2", "test-harness"]
 
 [[test]]
 name = "e2e_scheduler"
